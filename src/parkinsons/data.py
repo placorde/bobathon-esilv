@@ -4,6 +4,9 @@ Owns: loading raw CSVs from ``data/``, selecting the eight feature
 columns requested for the baseline experiments, and providing
 ``X_test`` for the Kaggle submission cell. Data paths are resolved
 via ``PROJECT_ROOT`` from the package root.
+
+Also exports ``load_raw_fe(data_dir)`` — a pure path-to-DataFrame
+function used by the DataOps graph in experiment 07.
 """
 
 from __future__ import annotations
@@ -120,6 +123,40 @@ def load_groups() -> "pd.Series":
     y_train = pd.read_csv(_DATA_DIR / "y_train.csv")
     merged = X_train.merge(y_train, on="Index")
     return merged["patient_id"]
+
+
+def load_raw_fe(data_dir: "str") -> pd.DataFrame:
+    """Return the merged training frame for the DataOps FE pipeline.
+
+    Pure function of ``data_dir``; suitable for use with
+    ``skrub.var("data_dir").skb.apply_func(load_raw_fe)``.
+
+    Returns a DataFrame with ``patient_id``, the ten feature columns
+    from ``FEATURE_COLS_FE``, and the ``target`` column — no column
+    selection is performed here; the DataOps graph handles that.
+
+    Parameters
+    ----------
+    data_dir : str or Path
+        Directory containing ``X_train.csv`` and ``y_train.csv``.
+
+    Returns
+    -------
+    pd.DataFrame
+        Shape ``(n_train, 12)`` — ``patient_id`` + ``FEATURE_COLS_FE``
+        (10 columns) + ``target``.
+    """
+    import pathlib  # noqa: PLC0415
+
+    data_dir = pathlib.Path(data_dir)
+    X_train = pd.read_csv(data_dir / "X_train.csv")
+    y_train = pd.read_csv(data_dir / "y_train.csv")
+    merged = X_train.merge(y_train, on="Index")
+    keep = ["patient_id"] + FEATURE_COLS_FE + [TARGET_COL]
+    result = merged[keep].copy()
+    result["rater_id"] = result["rater_id"].astype(object)
+    result["cohort"] = result["cohort"].astype(object)
+    return result
 
 
 def load_test_dataset() -> pd.DataFrame:

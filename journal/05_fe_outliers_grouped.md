@@ -72,7 +72,7 @@ them would discard real clinical variation.
 
 ## Status
 
-- **State:** approved
+- **State:** done
 - **Approved by user on:** 2025-10-12
-- **Headline result:** n/a
-- **Implication for next iteration:** n/a
+- **Headline result:** MAE 5.92 ± 0.11 | RMSE 7.54 ± 0.15 | R² 0.791 (GroupKFold 5)
+- **Implication for next iteration:** FE + HGBR improved MAE by ~3 % over bare HGBR (5.92 vs 6.10); the remaining gap vs a naïve ceiling (ON/OFF r ≈ 0.87/0.67) suggests letting a richer encoder handle all categoricals end-to-end may help — try skrub's `tabular_pipeline` which encodes object/category columns automatically.
