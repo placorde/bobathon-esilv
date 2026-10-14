@@ -10,7 +10,18 @@ Exports:
   using only strictly-prior visits (experiment 08).
 - ``SelfContainedTemporalFeatures``: stateless variant — computes
   expanding stats purely from the rows present in the frame passed at
-  transform time; no stored training history (experiment 08b).
+  transform time; no stored training history (experiment 08b / 08c).
+- ``RaterBiasEncoder``: supervised transformer (needs ``y`` at ``fit``)
+  that computes per-``rater_id`` mean of ``(target - off)`` on the
+  training fold and adds it as a numeric ``rater_bias`` feature.
+  Uses a global-mean fallback for unseen raters at predict time.
+  Safe under GroupKFold — leakage-free as long as skrub calls
+  ``fit`` only on training rows (experiment 09).
+- ``RecencyTemporalFeatures``: stateless variant of
+  ``SelfContainedTemporalFeatures`` that additionally computes last-1
+  (most recent prior value) and last-3 (mean of up to 3 most recent
+  prior values) stats for ``off`` and ``on``, giving the model a
+  recency-weighted view of each patient's trajectory (experiment 10).
 """
 
 from __future__ import annotations
@@ -167,18 +178,21 @@ class TemporalPatientFeatures(BaseEstimator, TransformerMixin):
         on_col = self.on_col
 
         # Sort so rows within each patient are in chronological order.
-        X = X.sort_values([pid_col, age_col]).copy()
+        # Keep track of original index to restore row order at the end.
+        original_index = X.index
+        X_sorted = X.sort_values([pid_col, age_col])
 
-        past_off_mean = np.full(len(X), np.nan)
-        past_off_trend = np.full(len(X), np.nan)
-        past_on_mean = np.full(len(X), np.nan)
-        past_on_trend = np.full(len(X), np.nan)
-        visit_count = np.zeros(len(X), dtype=float)
+        n = len(X_sorted)
+        past_off_mean = np.full(n, np.nan)
+        past_off_trend = np.full(n, np.nan)
+        past_on_mean = np.full(n, np.nan)
+        past_on_trend = np.full(n, np.nan)
+        visit_count = np.zeros(n, dtype=float)
 
-        age_vals = X[age_col].to_numpy(dtype=float)
-        off_vals = X[off_col].to_numpy(dtype=float)
-        on_vals = X[on_col].to_numpy(dtype=float)
-        pid_vals = X[pid_col].to_numpy()
+        age_vals = X_sorted[age_col].to_numpy(dtype=float)
+        off_vals = X_sorted[off_col].to_numpy(dtype=float)
+        on_vals = X_sorted[on_col].to_numpy(dtype=float)
+        pid_vals = X_sorted[pid_col].to_numpy()
 
         # Walk rows; accumulate per-patient history before computing.
         buf_pid: dict[object, dict] = {}
@@ -210,13 +224,15 @@ class TemporalPatientFeatures(BaseEstimator, TransformerMixin):
             state["offs"].append(off_vals[i])
             state["ons"].append(on_vals[i])
 
-        X = X.copy()
-        X["past_off_mean"] = past_off_mean
-        X["past_off_trend"] = past_off_trend
-        X["past_on_mean"] = past_on_mean
-        X["past_on_trend"] = past_on_trend
-        X["visit_count"] = visit_count
-        return X.drop(columns=[pid_col])
+        result = X_sorted.copy()
+        result["past_off_mean"] = past_off_mean
+        result["past_off_trend"] = past_off_trend
+        result["past_on_mean"] = past_on_mean
+        result["past_on_trend"] = past_on_trend
+        result["visit_count"] = visit_count
+        result = result.drop(columns=[pid_col])
+        # Restore original row order so downstream steps (y alignment) are correct.
+        return result.loc[original_index]
 
     def _apply_from_history(
         self, X: pd.DataFrame, history: dict[object, dict]
@@ -227,18 +243,20 @@ class TemporalPatientFeatures(BaseEstimator, TransformerMixin):
         off_col = self.off_col
         on_col = self.on_col
 
-        X = X.sort_values([pid_col, age_col]).copy()
+        original_index = X.index
+        X_sorted = X.sort_values([pid_col, age_col])
 
-        past_off_mean = np.full(len(X), np.nan)
-        past_off_trend = np.full(len(X), np.nan)
-        past_on_mean = np.full(len(X), np.nan)
-        past_on_trend = np.full(len(X), np.nan)
-        visit_count = np.zeros(len(X), dtype=float)
+        n = len(X_sorted)
+        past_off_mean = np.full(n, np.nan)
+        past_off_trend = np.full(n, np.nan)
+        past_on_mean = np.full(n, np.nan)
+        past_on_trend = np.full(n, np.nan)
+        visit_count = np.zeros(n, dtype=float)
 
-        age_vals = X[age_col].to_numpy(dtype=float)
-        off_vals = X[off_col].to_numpy(dtype=float)
-        on_vals = X[on_col].to_numpy(dtype=float)
-        pid_vals = X[pid_col].to_numpy()
+        age_vals = X_sorted[age_col].to_numpy(dtype=float)
+        off_vals = X_sorted[off_col].to_numpy(dtype=float)
+        on_vals = X_sorted[on_col].to_numpy(dtype=float)
+        pid_vals = X_sorted[pid_col].to_numpy()
 
         # Copy stored history so we can extend per-test-row without
         # mutating the fitted state across repeated transform calls.
@@ -272,13 +290,15 @@ class TemporalPatientFeatures(BaseEstimator, TransformerMixin):
             state["offs"].append(off_vals[i])
             state["ons"].append(on_vals[i])
 
-        X = X.copy()
-        X["past_off_mean"] = past_off_mean
-        X["past_off_trend"] = past_off_trend
-        X["past_on_mean"] = past_on_mean
-        X["past_on_trend"] = past_on_trend
-        X["visit_count"] = visit_count
-        return X.drop(columns=[pid_col])
+        result = X_sorted.copy()
+        result["past_off_mean"] = past_off_mean
+        result["past_off_trend"] = past_off_trend
+        result["past_on_mean"] = past_on_mean
+        result["past_on_trend"] = past_on_trend
+        result["visit_count"] = visit_count
+        result = result.drop(columns=[pid_col])
+        # Restore original row order so downstream steps (y alignment) are correct.
+        return result.loc[original_index]
 
     # ------------------------------------------------------------------
     # sklearn API
@@ -412,3 +432,250 @@ class SelfContainedTemporalFeatures(BaseEstimator, TransformerMixin):
             on_col=self.on_col,
         )
         return tf._compute_expanding(X)
+
+
+class RaterBiasEncoder(BaseEstimator, TransformerMixin):
+    """Per-rater mean offset encoder for experiment 09.
+
+    For each ``rater_id`` seen in training, computes the mean of
+    ``(y - off)`` across that rater's training rows and stores it as
+    ``rater_bias_``.  At transform time, maps each row's ``rater_id``
+    to its stored mean and adds a numeric ``rater_bias`` column.
+    Unseen raters receive the global training mean (``global_bias_``).
+
+    This is a classic out-of-fold supervised encoding: ``fit`` consumes
+    only the training fold's ``y``, so no validation-fold targets are
+    ever used to compute the means.
+
+    Parameters
+    ----------
+    rater_col : str, default ``"rater_id"``
+        Column identifying the rater.  Must be present in X at both
+        fit and transform time.
+    off_col : str, default ``"off"``
+        Column containing the motor-off UPDRS score.  Combined with
+        ``y`` to form the bias signal ``y - off``.
+    """
+
+    def __init__(
+        self,
+        rater_col: str = "rater_id",
+        off_col: str = "off",
+    ) -> None:
+        self.rater_col = rater_col
+        self.off_col = off_col
+
+    def fit(self, X: pd.DataFrame, y) -> "RaterBiasEncoder":
+        """Compute per-rater mean of (y - off) from training rows.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Must contain ``rater_col`` and ``off_col``.
+        y : array-like, shape (n_samples,)
+            Training targets (UPDRS scores).  Used only here; never at
+            transform time, so test-fold targets cannot leak.
+
+        Returns
+        -------
+        self
+        """
+        rater_col = self.rater_col
+        off_col = self.off_col
+
+        y_arr = np.asarray(y, dtype=float)
+        off_arr = X[off_col].to_numpy(dtype=float)
+        rater_arr = X[rater_col].to_numpy()
+
+        bias = y_arr - off_arr  # shape (n_train,)
+
+        # Aggregate per rater, ignoring NaN off values.
+        rater_map: dict[object, float] = {}
+        for rater in np.unique(rater_arr):
+            mask = (rater_arr == rater) & np.isfinite(bias)
+            rater_map[rater] = float(np.mean(bias[mask])) if mask.any() else np.nan
+
+        self.rater_bias_: dict[object, float] = rater_map
+        # Global fallback: mean over all finite bias values.
+        finite_mask = np.isfinite(bias)
+        self.global_bias_: float = (
+            float(np.mean(bias[finite_mask])) if finite_mask.any() else 0.0
+        )
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Add ``rater_bias`` column to X.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+            Must contain ``rater_col``.
+
+        Returns
+        -------
+        pd.DataFrame
+            Original frame with one extra numeric column ``rater_bias``.
+            Unseen raters receive the global training mean.
+        """
+        rater_arr = X[self.rater_col].to_numpy()
+        bias_vals = np.array(
+            [self.rater_bias_.get(r, self.global_bias_) for r in rater_arr],
+            dtype=float,
+        )
+        # Replace any NaN slots (raters with only NaN off rows) with global mean.
+        nan_mask = ~np.isfinite(bias_vals)
+        bias_vals[nan_mask] = self.global_bias_
+
+        X = X.copy()
+        X["rater_bias"] = bias_vals
+        return X
+
+
+class RecencyTemporalFeatures(BaseEstimator, TransformerMixin):
+    """Stateless temporal features with recency windows for experiment 10.
+
+    Computes **nine** per-patient features using only the rows present in
+    the frame passed to ``transform`` (no stored training history).  For
+    each visit, all stats are derived from strictly-prior visits of the
+    same patient in the current frame, sorted by ``age``.
+
+    Features added (9 total)
+    ------------------------
+    past_off_mean : float
+        Full expanding mean of ``off`` over all prior visits.
+    past_off_trend : float
+        OLS slope of ``off`` vs ``age`` over all prior non-NaN visits.
+    past_on_mean : float
+        Full expanding mean of ``on`` over all prior visits.
+    past_on_trend : float
+        OLS slope of ``on`` vs ``age`` over all prior non-NaN visits.
+    visit_count : int
+        Number of strictly-prior visits in the current frame.
+    last_off : float
+        ``off`` value of the single most recent prior visit (NaN if
+        that visit's ``off`` was NaN, or if there are no prior visits).
+    last_on : float
+        ``on`` value of the single most recent prior visit.
+    last3_off_mean : float
+        Mean of ``off`` over up to the 3 most recent prior visits that
+        have a finite ``off`` value.  NaN if none of the last 3 are finite.
+    last3_on_mean : float
+        Mean of ``on`` over up to the 3 most recent prior visits that
+        have a finite ``on`` value.  NaN if none of the last 3 are finite.
+
+    First visits of any patient produce all-NaN / zero-count stats.
+    ``HistGradientBoostingRegressor`` handles NaN natively.
+
+    Design notes
+    ------------
+    Identical cold-start-safe design to ``SelfContainedTemporalFeatures``:
+    stateless, no ``patient_history_``, index-order restored before return.
+
+    Parameters
+    ----------
+    age_col : str, default ``"age"``
+    patient_col : str, default ``"patient_id"``
+        Dropped from the output.
+    off_col : str, default ``"off"``
+    on_col : str, default ``"on"``
+    """
+
+    def __init__(
+        self,
+        age_col: str = "age",
+        patient_col: str = "patient_id",
+        off_col: str = "off",
+        on_col: str = "on",
+    ) -> None:
+        self.age_col = age_col
+        self.patient_col = patient_col
+        self.off_col = off_col
+        self.on_col = on_col
+
+    def fit(self, X: pd.DataFrame, y=None) -> "RecencyTemporalFeatures":  # noqa: ARG002
+        """No-op — transformer is stateless; records input width only."""
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Compute all temporal + recency stats within X and return enriched frame."""
+        age_col = self.age_col
+        pid_col = self.patient_col
+        off_col = self.off_col
+        on_col = self.on_col
+
+        original_index = X.index
+        X_sorted = X.sort_values([pid_col, age_col])
+
+        n = len(X_sorted)
+        past_off_mean  = np.full(n, np.nan)
+        past_off_trend = np.full(n, np.nan)
+        past_on_mean   = np.full(n, np.nan)
+        past_on_trend  = np.full(n, np.nan)
+        visit_count    = np.zeros(n, dtype=float)
+        last_off       = np.full(n, np.nan)
+        last_on        = np.full(n, np.nan)
+        last3_off_mean = np.full(n, np.nan)
+        last3_on_mean  = np.full(n, np.nan)
+
+        age_vals = X_sorted[age_col].to_numpy(dtype=float)
+        off_vals = X_sorted[off_col].to_numpy(dtype=float)
+        on_vals  = X_sorted[on_col].to_numpy(dtype=float)
+        pid_vals = X_sorted[pid_col].to_numpy()
+
+        # Per-patient accumulator: ages / offs / ons in chronological order
+        # (appended AFTER the current row reads, so strictly prior).
+        buf: dict[object, dict] = {}
+
+        for i, pid in enumerate(pid_vals):
+            state = buf.get(pid)
+
+            if state is not None and state["count"] > 0:
+                offs   = np.array(state["offs"])
+                ons    = np.array(state["ons"])
+                ages_a = np.array(state["ages"])
+                cnt    = state["count"]
+
+                visit_count[i] = cnt
+
+                # --- full expanding stats (same as SelfContainedTemporalFeatures) ---
+                past_off_mean[i]  = np.nanmean(offs) if np.any(np.isfinite(offs)) else np.nan
+                past_off_trend[i] = _slope(ages_a, offs)
+                past_on_mean[i]   = np.nanmean(ons)  if np.any(np.isfinite(ons))  else np.nan
+                past_on_trend[i]  = _slope(ages_a, ons)
+
+                # --- last-1: value from the single most recent prior visit ---
+                last_off[i] = offs[-1]   # may be NaN if that visit's off was NaN
+                last_on[i]  = ons[-1]
+
+                # --- last-3: mean over up to 3 most recent prior visits ---
+                # Slice the last min(3, cnt) entries; ignore NaN values.
+                window = min(3, cnt)
+                off_w = offs[-window:]
+                on_w  = ons[-window:]
+                last3_off_mean[i] = np.nanmean(off_w) if np.any(np.isfinite(off_w)) else np.nan
+                last3_on_mean[i]  = np.nanmean(on_w)  if np.any(np.isfinite(on_w))  else np.nan
+
+            # Append current row AFTER reading (strictly prior for next row).
+            if state is None:
+                buf[pid] = {"count": 0, "ages": [], "offs": [], "ons": []}
+                state = buf[pid]
+            state["count"] += 1
+            state["ages"].append(age_vals[i])
+            state["offs"].append(off_vals[i])
+            state["ons"].append(on_vals[i])
+
+        result = X_sorted.copy()
+        result["past_off_mean"]  = past_off_mean
+        result["past_off_trend"] = past_off_trend
+        result["past_on_mean"]   = past_on_mean
+        result["past_on_trend"]  = past_on_trend
+        result["visit_count"]    = visit_count
+        result["last_off"]       = last_off
+        result["last_on"]        = last_on
+        result["last3_off_mean"] = last3_off_mean
+        result["last3_on_mean"]  = last3_on_mean
+        result = result.drop(columns=[pid_col])
+        # Restore original row order so downstream steps (y alignment) are correct.
+        return result.loc[original_index]

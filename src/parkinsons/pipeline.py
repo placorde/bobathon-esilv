@@ -18,7 +18,16 @@ Each public function returns an unfitted estimator ready for
   count) before the experiment-05 FE and HGBR (08_temporal_grouped).
 - ``build_temporal_selfcontained_learner``: same but uses
   ``SelfContainedTemporalFeatures`` — stateless, computes expanding
-  stats purely from the current fold's rows (08b).
+  stats purely from the current fold's rows (08b / 08c).
+- ``build_rater_encoding_learner``: extends 08c with a per-rater mean
+  bias encoder (``RaterBiasEncoder``) inserted after ``EngineerFeatures``
+  and wired with ``y`` so it is leakage-free under GroupKFold (09).
+- ``build_recency_temporal_learner``: extends 08c with
+  ``RecencyTemporalFeatures`` — adds last-1 and last-3 recency windows
+  for ``off``/``on`` on top of the existing 5 expanding features (10).
+- ``build_hgbr_tuned_learner``: same as 10 but with explicit HGBR
+  hyperparameters (max_iter, max_depth, learning_rate).  Used to push
+  the winning grid-search combination from experiment 11 to the hub.
 """
 
 from __future__ import annotations
@@ -336,5 +345,203 @@ def build_temporal_selfcontained_learner(data_dir_preview=None):
     X_fe = X_temporal.skb.apply(EngineerFeatures(clip_off=True))
     predictions = X_fe.skb.apply(
         HistGradientBoostingRegressor(random_state=0), y=y
+    )
+    return predictions.skb.make_learner()
+
+
+def build_rater_encoding_learner(data_dir_preview=None):
+    """Return the unfit DataOps learner for experiment 09.
+
+    Extends ``build_temporal_selfcontained_learner`` (08c) with a
+    per-rater mean bias encoder inserted after ``EngineerFeatures``:
+
+    - Layer 1: ``skrub.var("data_dir")`` → ``load_raw_fe``.
+    - Layer 2: ``patient_id`` as ``groups``; ``X`` (including
+      ``patient_id``) marked with ``cv=GroupKFold(n_splits=5)`` and
+      ``split_kwargs={"groups": groups}``; ``y`` marked.
+    - Layer 3a: ``SelfContainedTemporalFeatures`` (drops ``patient_id``).
+    - Layer 3b: ``EngineerFeatures`` (derives ``years_since_diagnosis``,
+      casts ``rater_id``/``cohort`` to category, clips ``off``).
+    - Layer 3c: ``RaterBiasEncoder(y=y)`` — supervised step; computes
+      per-rater mean of ``(y - off)`` from training rows only, adds
+      numeric ``rater_bias`` column.  Wired with ``y=y`` so skrub passes
+      training targets to ``fit`` but never to ``transform``.
+    - Predictor: ``HistGradientBoostingRegressor(random_state=0)``.
+
+    No leakage: skrub DataOps calls ``RaterBiasEncoder.fit(X_train, y_train)``
+    per fold with training rows only; ``transform`` is called on both
+    train and test rows using only the fitted means.
+
+    Parameters
+    ----------
+    data_dir_preview : str or Path or None, default=None
+        Optional preview path for ``learner.skb.preview()``.
+
+    Returns
+    -------
+    skrub SkrubLearner
+    """
+    from parkinsons.data import TARGET_COL, load_raw_fe  # noqa: PLC0415
+    from parkinsons.features import (  # noqa: PLC0415
+        EngineerFeatures,
+        RaterBiasEncoder,
+        SelfContainedTemporalFeatures,
+    )
+
+    data_dir = (
+        skrub.var("data_dir", value=str(data_dir_preview))
+        if data_dir_preview is not None
+        else skrub.var("data_dir")
+    )
+
+    data = data_dir.skb.apply_func(load_raw_fe)
+
+    groups = data["patient_id"]
+    X_with_pid = data.drop(columns=[TARGET_COL]).skb.mark_as_X(
+        cv=GroupKFold(n_splits=5),
+        split_kwargs={"groups": groups},
+    )
+    y = data[TARGET_COL].skb.mark_as_y()
+
+    # Layer 3a: temporal features (drops patient_id)
+    X_temporal = X_with_pid.skb.apply(SelfContainedTemporalFeatures())
+    # Layer 3b: standard FE (years_since_diagnosis, clip off, cast categoricals)
+    X_fe = X_temporal.skb.apply(EngineerFeatures(clip_off=True))
+    # Layer 3c: per-rater bias encoding — supervised, leakage-free via y=y
+    X_enc = X_fe.skb.apply(RaterBiasEncoder(), y=y)
+    # Predictor
+    predictions = X_enc.skb.apply(
+        HistGradientBoostingRegressor(random_state=0), y=y
+    )
+    return predictions.skb.make_learner()
+
+
+def build_recency_temporal_learner(data_dir_preview=None):
+    """Return the unfit DataOps learner for experiment 10.
+
+    Extends ``build_temporal_selfcontained_learner`` (08c) by swapping
+    ``SelfContainedTemporalFeatures`` for ``RecencyTemporalFeatures``,
+    which computes the same 5 expanding features as 08c **plus** 4
+    recency-window features:
+
+    - ``last_off`` / ``last_on``: value from the single most recent
+      prior visit of this patient in the current frame.
+    - ``last3_off_mean`` / ``last3_on_mean``: mean of up to 3 most
+      recent prior visits (finite values only).
+
+    Layer structure:
+
+    - Layer 1: ``skrub.var("data_dir")`` → ``load_raw_fe``.
+    - Layer 2: ``patient_id`` as ``groups``; ``X`` (including
+      ``patient_id``) marked with ``cv=GroupKFold(n_splits=5)`` and
+      ``split_kwargs={"groups": groups}``; ``y`` marked.
+    - Layer 3a: ``RecencyTemporalFeatures`` (9 temporal features, drops
+      ``patient_id``).
+    - Layer 3b: ``EngineerFeatures``.
+    - Predictor: ``HistGradientBoostingRegressor(random_state=0)``.
+
+    Same cold-start-safe design as 08c: stateless, no stored history,
+    index-order restored before return.
+
+    Parameters
+    ----------
+    data_dir_preview : str or Path or None, default=None
+        Optional preview path for ``learner.skb.preview()``.
+
+    Returns
+    -------
+    skrub SkrubLearner
+    """
+    from parkinsons.data import TARGET_COL, load_raw_fe  # noqa: PLC0415
+    from parkinsons.features import (  # noqa: PLC0415
+        EngineerFeatures,
+        RecencyTemporalFeatures,
+    )
+
+    data_dir = (
+        skrub.var("data_dir", value=str(data_dir_preview))
+        if data_dir_preview is not None
+        else skrub.var("data_dir")
+    )
+
+    data = data_dir.skb.apply_func(load_raw_fe)
+
+    groups = data["patient_id"]
+    X_with_pid = data.drop(columns=[TARGET_COL]).skb.mark_as_X(
+        cv=GroupKFold(n_splits=5),
+        split_kwargs={"groups": groups},
+    )
+    y = data[TARGET_COL].skb.mark_as_y()
+
+    # Layer 3a: recency temporal features (drops patient_id, adds 9 features)
+    X_temporal = X_with_pid.skb.apply(RecencyTemporalFeatures())
+    # Layer 3b: standard FE (years_since_diagnosis, clip off, cast categoricals)
+    X_fe = X_temporal.skb.apply(EngineerFeatures(clip_off=True))
+    # Predictor
+    predictions = X_fe.skb.apply(
+        HistGradientBoostingRegressor(random_state=0), y=y
+    )
+    return predictions.skb.make_learner()
+
+
+def build_hgbr_tuned_learner(
+    max_iter: int = 200,
+    max_depth: "int | None" = None,
+    learning_rate: float = 0.1,
+    data_dir_preview=None,
+):
+    """Return the unfit DataOps learner for experiment 11.
+
+    Identical graph to ``build_recency_temporal_learner`` (experiment 10)
+    except the ``HistGradientBoostingRegressor`` uses explicit
+    hyperparameters rather than defaults. Intended to push the winning
+    combination from the experiment-11 grid search to the Skore Hub.
+
+    Parameters
+    ----------
+    max_iter : int, default 200
+        Number of boosting iterations.
+    max_depth : int or None, default None
+        Maximum tree depth. ``None`` means no limit (sklearn default).
+    learning_rate : float, default 0.1
+        Shrinkage factor applied to each tree.
+    data_dir_preview : str or Path or None, default=None
+        Optional preview path for ``learner.skb.preview()``.
+
+    Returns
+    -------
+    skrub SkrubLearner
+    """
+    from parkinsons.data import TARGET_COL, load_raw_fe  # noqa: PLC0415
+    from parkinsons.features import (  # noqa: PLC0415
+        EngineerFeatures,
+        RecencyTemporalFeatures,
+    )
+
+    data_dir = (
+        skrub.var("data_dir", value=str(data_dir_preview))
+        if data_dir_preview is not None
+        else skrub.var("data_dir")
+    )
+
+    data = data_dir.skb.apply_func(load_raw_fe)
+
+    groups = data["patient_id"]
+    X_with_pid = data.drop(columns=[TARGET_COL]).skb.mark_as_X(
+        cv=GroupKFold(n_splits=5),
+        split_kwargs={"groups": groups},
+    )
+    y = data[TARGET_COL].skb.mark_as_y()
+
+    X_temporal = X_with_pid.skb.apply(RecencyTemporalFeatures())
+    X_fe = X_temporal.skb.apply(EngineerFeatures(clip_off=True))
+    predictions = X_fe.skb.apply(
+        HistGradientBoostingRegressor(
+            max_iter=max_iter,
+            max_depth=max_depth,
+            learning_rate=learning_rate,
+            random_state=0,
+        ),
+        y=y,
     )
     return predictions.skb.make_learner()
